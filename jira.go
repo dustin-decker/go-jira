@@ -324,9 +324,14 @@ func (c *Client) GetBaseURL() url.URL {
 type Response struct {
 	*http.Response
 
+	// Legacy pagination fields (used by older endpoints)
 	StartAt    int
 	MaxResults int
 	Total      int
+
+	// Token-based pagination (used by newer endpoints like /search/jql)
+	// https://developer.atlassian.com/changelog/#CHANGE-2046
+	NextPageToken string
 }
 
 func newResponse(r *http.Response, v interface{}) *Response {
@@ -339,11 +344,14 @@ func newResponse(r *http.Response, v interface{}) *Response {
 // (can be extended with other types if they also need paging info)
 func (r *Response) populatePageValues(v interface{}) {
 	switch value := v.(type) {
-	case *searchResult:
-		r.StartAt = value.StartAt
-		r.MaxResults = value.MaxResults
-		r.Total = value.Total
+	case *jqlSearchResult:
+		// Set NextPageToken for token-based pagination
+		r.NextPageToken = value.NextPageToken
+		// StartAt, MaxResults, and Total are not available in jqlSearchResult
+		// as the new /search/jql endpoint does not return them.
+		// These fields in the Response struct will remain 0 for JQL searches.
 	case *groupMembersResult:
+		// Legacy pagination fields for older endpoints
 		r.StartAt = value.StartAt
 		r.MaxResults = value.MaxResults
 		r.Total = value.Total
@@ -561,8 +569,9 @@ func (t *CookieAuthTransport) transport() http.RoundTripper {
 //
 // Jira docs: https://developer.atlassian.com/cloud/jira/platform/understanding-jwt
 // Examples in other languages:
-//    https://bitbucket.org/atlassian/atlassian-jwt-ruby/src/d44a8e7a4649e4f23edaa784402655fda7c816ea/lib/atlassian/jwt.rb
-//    https://bitbucket.org/atlassian/atlassian-jwt-py/src/master/atlassian_jwt/url_utils.py
+//
+//	https://bitbucket.org/atlassian/atlassian-jwt-ruby/src/d44a8e7a4649e4f23edaa784402655fda7c816ea/lib/atlassian/jwt.rb
+//	https://bitbucket.org/atlassian/atlassian-jwt-py/src/master/atlassian_jwt/url_utils.py
 type JWTAuthTransport struct {
 	Secret []byte
 	Issuer string

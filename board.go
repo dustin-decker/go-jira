@@ -43,7 +43,25 @@ type BoardListOptions struct {
 	// Relevance meaning that the JQL filter defined in board contains a reference to a project.
 	ProjectKeyOrID string `url:"projectKeyOrId,omitempty"`
 
-	SearchOptions
+	BoardSearchOptions
+}
+
+// BoardSearchOptions specifies the optional parameters to various List methods that
+// support pagination.
+// Pagination is used for the Jira REST APIs to conserve server resources and limit
+// response size for resources that return potentially large collection of items.
+// A request to a pages API will result in a values array wrapped in a JSON object with some paging metadata
+// Default Pagination options
+type BoardSearchOptions struct {
+	// StartAt: The starting index of the returned projects. Base index: 0.
+	StartAt int `url:"startAt,omitempty"`
+	// MaxResults: The maximum number of projects to return per page. Default: 50.
+	MaxResults int `url:"maxResults,omitempty"`
+	// Expand: Expand specific sections in the returned issues
+	Expand string `url:"expand,omitempty"`
+	Fields []string
+	// ValidateQuery: The validateQuery param offers control over whether to validate and how strictly to treat the validation. Default: strict.
+	ValidateQuery string `url:"validateQuery,omitempty"`
 }
 
 // GetAllSprintsOptions specifies the optional parameters to the BoardService.GetList

@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -418,7 +418,7 @@ func TestIssueService_DownloadAttachment(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	attachment, err := ioutil.ReadAll(resp.Body)
+	attachment, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Error("Expected attachment text", err)
 	}
@@ -477,7 +477,7 @@ func TestIssueService_PostAttachment(t *testing.T) {
 			status = http.StatusNoContent
 		} else {
 			// Read the file into memory
-			data, err := ioutil.ReadAll(file)
+			data, err := io.ReadAll(file)
 			if err != nil {
 				status = http.StatusInternalServerError
 			}
@@ -619,117 +619,275 @@ func TestIssueService_DeleteLink(t *testing.T) {
 func TestIssueService_Search(t *testing.T) {
 	setup()
 	defer teardown()
-	testMux.HandleFunc("/rest/api/2/search", func(w http.ResponseWriter, r *http.Request) {
-		testMethod(t, r, "GET")
-		testRequestURL(t, r, "/rest/api/2/search?expand=foo&jql=type+%3D+Bug+and+Status+NOT+IN+%28Resolved%29&maxResults=40&startAt=1")
+
+	// Mock for POST /rest/api/3/search/jql
+	testMux.HandleFunc("/rest/api/3/search/jql", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "POST")
+		testRequestURL(t, r, "/rest/api/3/search/jql")
+
+		// Check request body
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var requestBody map[string]interface{}
+		json.Unmarshal(bodyBytes, &requestBody)
+
+		// Check required fields
+		if requestBody["jql"] != "type = Bug and Status NOT IN (Resolved)" {
+			t.Errorf("Expected jql: 'type = Bug and Status NOT IN (Resolved)', got: %v", requestBody["jql"])
+		}
+		if requestBody["maxResults"] != float64(40) {
+			t.Errorf("Expected maxResults: 40, got: %v", requestBody["maxResults"])
+		}
+		// Note: fields may or may not be present depending on implementation
+
+		// Send response
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"expand": "schema,names","startAt": 1,"maxResults": 40,"total": 6,"issues": [{"expand": "html","id": "10230","self": "http://kelpie9:8081/rest/api/2/issue/BULK-62","key": "BULK-62","fields": {"summary": "testing","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/5","id": "5","description": "The sub-task of the issue","iconUrl": "http://kelpie9:8081/images/icons/issue_subtask.gif","name": "Sub-task","subtask": true},"customfield_10071": null}},{"expand": "html","id": "10004","self": "http://kelpie9:8081/rest/api/2/issue/BULK-47","key": "BULK-47","fields": {"summary": "Cheese v1 2.0 issue","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/3","id": "3","description": "A task that needs to be done.","iconUrl": "http://kelpie9:8081/images/icons/task.gif","name": "Task","subtask": false}}}]}`)
+		// Only return IDs/Keys and nextPageToken
+		fmt.Fprint(w, `{"issues":[{"id":"10230","key":"BULK-62"},{"id":"10004","key":"BULK-47"}],"nextPageToken":"nextToken123"}`)
 	})
 
-	opt := &SearchOptions{StartAt: 1, MaxResults: 40, Expand: "foo"}
-	_, resp, err := testClient.Issue.Search("type = Bug and Status NOT IN (Resolved)", opt)
+	// Mock for POST /rest/api/3/issue/bulkfetch
+	testMux.HandleFunc("/rest/api/3/issue/bulkfetch", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "POST")
+		testRequestURL(t, r, "/rest/api/3/issue/bulkfetch")
 
-	if resp == nil {
-		t.Errorf("Response given: %+v", resp)
-	}
+		// Check request body
+		expectedBody := `{"issueIdsOrKeys":["10230","10004"],"fields":["*navigable"]}` // Assuming *navigable for previous 'expand'
+		bodyBytes, _ := io.ReadAll(r.Body)
+		if diff := cmp.Diff(expectedBody, strings.TrimSpace(string(bodyBytes))); diff != "" {
+			t.Errorf("Bulk Fetch Request body mismatch (-want +got):\n%s", diff)
+		}
+
+		// Send response with full issue details (using original mock data)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"issues": [{"expand": "html","id": "10230","self": "http://kelpie9:8081/rest/api/2/issue/BULK-62","key": "BULK-62","fields": {"summary": "testing","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/5","id": "5","description": "The sub-task of the issue","iconUrl": "http://kelpie9:8081/images/icons/issue_subtask.gif","name": "Sub-task","subtask": true},"customfield_10071": null}},{"expand": "html","id": "10004","self": "http://kelpie9:8081/rest/api/2/issue/BULK-47","key": "BULK-47","fields": {"summary": "Cheese v1 2.0 issue","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/3","id": "3","description": "A task that needs to be done.","iconUrl": "http://kelpie9:8081/images/icons/task.gif","name": "Task","subtask": false}}}]}`)
+	})
+
+	// Use new SearchOptions, requesting fields to trigger bulk fetch
+	opt := &SearchOptions{MaxResults: 40, Fields: []string{"*navigable"}}
+	issues, resp, token, err := testClient.Issue.Search("type = Bug and Status NOT IN (Resolved)", opt)
+
 	if err != nil {
 		t.Errorf("Error given: %s", err)
 	}
+	if resp == nil {
+		t.Errorf("Response is nil")
+	}
+	if token != "nextToken123" {
+		t.Errorf("Expected nextPageToken 'nextToken123', got '%s'", token)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("Expected 2 issues, got %d", len(issues))
+	}
+	// Basic check on returned issues
+	if issues[0].ID != "10230" || issues[0].Key != "BULK-62" {
+		t.Errorf("Unexpected issue[0]: ID=%s Key=%s", issues[0].ID, issues[0].Key)
+	}
+	if issues[1].ID != "10004" || issues[1].Key != "BULK-47" {
+		t.Errorf("Unexpected issue[1]: ID=%s Key=%s", issues[1].ID, issues[1].Key)
+	}
+	// Check if fields were populated by bulk fetch
+	if issues[0].Fields == nil || issues[0].Fields.Summary != "testing" {
+		t.Errorf("Expected fields to be populated for issue[0], summary: %v", issues[0].Fields)
+	}
+	if issues[1].Fields == nil || issues[1].Fields.Summary != "Cheese v1 2.0 issue" {
+		t.Errorf("Expected fields to be populated for issue[1], summary: %v", issues[1].Fields)
+	}
 
-	if resp.StartAt != 1 {
-		t.Errorf("StartAt should populate with 1, %v given", resp.StartAt)
-	}
-	if resp.MaxResults != 40 {
-		t.Errorf("MaxResults should populate with 40, %v given", resp.MaxResults)
-	}
-	if resp.Total != 6 {
-		t.Errorf("Total should populate with 6, %v given", resp.Total)
-	}
+	// Note: Assertions on resp.StartAt, resp.MaxResults, resp.Total are removed
+	// as they are no longer populated by the new API/function.
 }
 
 func TestIssueService_SearchEmptyJQL(t *testing.T) {
 	setup()
 	defer teardown()
-	testMux.HandleFunc("/rest/api/2/search", func(w http.ResponseWriter, r *http.Request) {
-		testMethod(t, r, "GET")
-		testRequestURL(t, r, "/rest/api/2/search?expand=foo&maxResults=40&startAt=1")
+	// Mock for POST /rest/api/3/search/jql (empty JQL)
+	testMux.HandleFunc("/rest/api/3/search/jql", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "POST")
+		testRequestURL(t, r, "/rest/api/3/search/jql")
+
+		// Check request body (should not contain "jql" key if empty)
+		expectedBody := `{"fields":["*navigable"],"maxResults":40}` // Assuming fields requested due to old Expand
+		bodyBytes, _ := io.ReadAll(r.Body)
+		// Use json unmarshal and compare maps for flexibility in key order
+		var expectedMap, actualMap map[string]interface{}
+		json.Unmarshal([]byte(expectedBody), &expectedMap)
+		json.Unmarshal(bodyBytes, &actualMap)
+		if diff := cmp.Diff(expectedMap, actualMap); diff != "" {
+			// Allow for jql key to be present but empty string
+			if actualMap["jql"] != "" {
+				t.Errorf("Request body mismatch (-want +got):\n%s", diff)
+			} else {
+				delete(actualMap, "jql") // remove empty jql for comparison
+				if diff := cmp.Diff(expectedMap, actualMap); diff != "" {
+					t.Errorf("Request body mismatch (-want +got):\n%s", diff)
+				}
+			}
+		}
+
+		// Send response
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"expand": "schema,names","startAt": 1,"maxResults": 40,"total": 6,"issues": [{"expand": "html","id": "10230","self": "http://kelpie9:8081/rest/api/2/issue/BULK-62","key": "BULK-62","fields": {"summary": "testing","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/5","id": "5","description": "The sub-task of the issue","iconUrl": "http://kelpie9:8081/images/icons/issue_subtask.gif","name": "Sub-task","subtask": true},"customfield_10071": null}},{"expand": "html","id": "10004","self": "http://kelpie9:8081/rest/api/2/issue/BULK-47","key": "BULK-47","fields": {"summary": "Cheese v1 2.0 issue","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/3","id": "3","description": "A task that needs to be done.","iconUrl": "http://kelpie9:8081/images/icons/task.gif","name": "Task","subtask": false}}}]}`)
+		fmt.Fprint(w, `{"issues":[{"id":"10230","key":"BULK-62"},{"id":"10004","key":"BULK-47"}],"nextPageToken":"emptyJQLToken"}`)
 	})
 
-	opt := &SearchOptions{StartAt: 1, MaxResults: 40, Expand: "foo"}
-	_, resp, err := testClient.Issue.Search("", opt)
+	// Mock for POST /rest/api/3/issue/bulkfetch (corresponding to empty JQL search)
+	testMux.HandleFunc("/rest/api/3/issue/bulkfetch", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "POST")
+		testRequestURL(t, r, "/rest/api/3/issue/bulkfetch")
 
-	if resp == nil {
-		t.Errorf("Response given: %+v", resp)
-	}
+		// Check request body
+		expectedBody := `{"issueIdsOrKeys":["10230","10004"],"fields":["*navigable"]}`
+		bodyBytes, _ := io.ReadAll(r.Body)
+		if diff := cmp.Diff(expectedBody, strings.TrimSpace(string(bodyBytes))); diff != "" {
+			t.Errorf("Bulk Fetch Request body mismatch (-want +got):\n%s", diff)
+		}
+
+		// Send response with full issue details
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"issues": [{"expand": "html","id": "10230","self": "http://kelpie9:8081/rest/api/2/issue/BULK-62","key": "BULK-62","fields": {"summary": "testing","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/5","id": "5","description": "The sub-task of the issue","iconUrl": "http://kelpie9:8081/images/icons/issue_subtask.gif","name": "Sub-task","subtask": true},"customfield_10071": null}},{"expand": "html","id": "10004","self": "http://kelpie9:8081/rest/api/2/issue/BULK-47","key": "BULK-47","fields": {"summary": "Cheese v1 2.0 issue","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/3","id": "3","description": "A task that needs to be done.","iconUrl": "http://kelpie9:8081/images/icons/task.gif","name": "Task","subtask": false}}}]}`)
+	})
+
+	// Use new SearchOptions, remove invalid fields (StartAt, Expand)
+	// Assuming Expand="foo" meant we wanted navigable fields
+	opt := &SearchOptions{MaxResults: 40, Fields: []string{"*navigable"}}
+	// Update assignment to capture 4 return values
+	issues, resp, token, err := testClient.Issue.Search("", opt)
+
 	if err != nil {
 		t.Errorf("Error given: %s", err)
 	}
+	if resp == nil {
+		t.Errorf("Response is nil")
+	}
+	if token != "emptyJQLToken" {
+		t.Errorf("Expected nextPageToken 'emptyJQLToken', got '%s'", token)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("Expected 2 issues, got %d", len(issues))
+	}
+	// Basic check on returned issues
+	if issues[0].ID != "10230" || issues[0].Fields == nil || issues[0].Fields.Summary != "testing" {
+		t.Errorf("Unexpected or incomplete issue[0]: %+v", issues[0])
+	}
+	if issues[1].ID != "10004" || issues[1].Fields == nil || issues[1].Fields.Summary != "Cheese v1 2.0 issue" {
+		t.Errorf("Unexpected or incomplete issue[1]: %+v", issues[1])
+	}
 
-	if resp.StartAt != 1 {
-		t.Errorf("StartAt should populate with 1, %v given", resp.StartAt)
-	}
-	if resp.MaxResults != 40 {
-		t.Errorf("StartAt should populate with 40, %v given", resp.MaxResults)
-	}
-	if resp.Total != 6 {
-		t.Errorf("StartAt should populate with 6, %v given", resp.Total)
-	}
+	// Assertions on resp.StartAt, resp.MaxResults, resp.Total are removed.
 }
 
 func TestIssueService_Search_WithoutPaging(t *testing.T) {
 	setup()
 	defer teardown()
-	testMux.HandleFunc("/rest/api/2/search", func(w http.ResponseWriter, r *http.Request) {
-		testMethod(t, r, "GET")
-		testRequestURL(t, r, "/rest/api/2/search?jql=something")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"expand": "schema,names","startAt": 0,"maxResults": 50,"total": 6,"issues": [{"expand": "html","id": "10230","self": "http://kelpie9:8081/rest/api/2/issue/BULK-62","key": "BULK-62","fields": {"summary": "testing","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/5","id": "5","description": "The sub-task of the issue","iconUrl": "http://kelpie9:8081/images/icons/issue_subtask.gif","name": "Sub-task","subtask": true},"customfield_10071": null}},{"expand": "html","id": "10004","self": "http://kelpie9:8081/rest/api/2/issue/BULK-47","key": "BULK-47","fields": {"summary": "Cheese v1 2.0 issue","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/3","id": "3","description": "A task that needs to be done.","iconUrl": "http://kelpie9:8081/images/icons/task.gif","name": "Task","subtask": false}}}]}`)
-	})
-	_, resp, err := testClient.Issue.Search("something", nil)
+	// Mock for POST /rest/api/3/search/jql
+	testMux.HandleFunc("/rest/api/3/search/jql", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "POST")
+		testRequestURL(t, r, "/rest/api/3/search/jql")
 
-	if resp == nil {
-		t.Errorf("Response given: %+v", resp)
-	}
+		// Check request body (should only contain jql)
+		expectedBody := `{"jql":"something"}`
+		bodyBytes, _ := io.ReadAll(r.Body)
+		if diff := cmp.Diff(expectedBody, strings.TrimSpace(string(bodyBytes))); diff != "" {
+			t.Errorf("Request body mismatch (-want +got):\n%s", diff)
+		}
+
+		// Send response with only IDs/Keys and token
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"issues":[{"id":"10230","key":"BULK-62"},{"id":"10004","key":"BULK-47"}],"nextPageToken":"noPagingToken"}`)
+	})
+
+	// No bulk fetch mock needed as no fields are requested when options is nil
+
+	// Update assignment to capture 4 return values
+	issues, resp, token, err := testClient.Issue.Search("something", nil)
+
 	if err != nil {
 		t.Errorf("Error given: %s", err)
 	}
+	if resp == nil {
+		t.Errorf("Response is nil")
+	}
+	if token != "noPagingToken" {
+		t.Errorf("Expected nextPageToken 'noPagingToken', got '%s'", token)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("Expected 2 issues, got %d", len(issues))
+	}
+	// Check limited issue data (Fields should be nil)
+	if issues[0].ID != "10230" || issues[0].Key != "BULK-62" || issues[0].Fields != nil {
+		t.Errorf("Unexpected issue[0]: %+v", issues[0])
+	}
+	if issues[1].ID != "10004" || issues[1].Key != "BULK-47" || issues[1].Fields != nil {
+		t.Errorf("Unexpected issue[1]: %+v", issues[1])
+	}
 
-	if resp.StartAt != 0 {
-		t.Errorf("StartAt should populate with 0, %v given", resp.StartAt)
-	}
-	if resp.MaxResults != 50 {
-		t.Errorf("StartAt should populate with 50, %v given", resp.MaxResults)
-	}
-	if resp.Total != 6 {
-		t.Errorf("StartAt should populate with 6, %v given", resp.Total)
-	}
+	// Assertions on resp.StartAt, resp.MaxResults, resp.Total are removed.
 }
 
 func TestIssueService_SearchPages(t *testing.T) {
 	setup()
 	defer teardown()
-	testMux.HandleFunc("/rest/api/2/search", func(w http.ResponseWriter, r *http.Request) {
-		testMethod(t, r, "GET")
-		if r.URL.String() == "/rest/api/2/search?expand=foo&jql=something&maxResults=2&startAt=1&validateQuery=warn" {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, `{"expand": "schema,names","startAt": 1,"maxResults": 2,"total": 6,"issues": [{"expand": "html","id": "10230","self": "http://kelpie9:8081/rest/api/2/issue/BULK-62","key": "BULK-62","fields": {"summary": "testing","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/5","id": "5","description": "The sub-task of the issue","iconUrl": "http://kelpie9:8081/images/icons/issue_subtask.gif","name": "Sub-task","subtask": true},"customfield_10071": null}},{"expand": "html","id": "10004","self": "http://kelpie9:8081/rest/api/2/issue/BULK-47","key": "BULK-47","fields": {"summary": "Cheese v1 2.0 issue","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/3","id": "3","description": "A task that needs to be done.","iconUrl": "http://kelpie9:8081/images/icons/task.gif","name": "Task","subtask": false}}}]}`)
-			return
-		} else if r.URL.String() == "/rest/api/2/search?expand=foo&jql=something&maxResults=2&startAt=3&validateQuery=warn" {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, `{"expand": "schema,names","startAt": 3,"maxResults": 2,"total": 6,"issues": [{"expand": "html","id": "10230","self": "http://kelpie9:8081/rest/api/2/issue/BULK-62","key": "BULK-62","fields": {"summary": "testing","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/5","id": "5","description": "The sub-task of the issue","iconUrl": "http://kelpie9:8081/images/icons/issue_subtask.gif","name": "Sub-task","subtask": true},"customfield_10071": null}},{"expand": "html","id": "10004","self": "http://kelpie9:8081/rest/api/2/issue/BULK-47","key": "BULK-47","fields": {"summary": "Cheese v1 2.0 issue","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/3","id": "3","description": "A task that needs to be done.","iconUrl": "http://kelpie9:8081/images/icons/task.gif","name": "Task","subtask": false}}}]}`)
-			return
-		} else if r.URL.String() == "/rest/api/2/search?expand=foo&jql=something&maxResults=2&startAt=5&validateQuery=warn" {
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprint(w, `{"expand": "schema,names","startAt": 5,"maxResults": 2,"total": 6,"issues": [{"expand": "html","id": "10230","self": "http://kelpie9:8081/rest/api/2/issue/BULK-62","key": "BULK-62","fields": {"summary": "testing","timetracking": null,"issuetype": {"self": "http://kelpie9:8081/rest/api/2/issuetype/5","id": "5","description": "The sub-task of the issue","iconUrl": "http://kelpie9:8081/images/icons/issue_subtask.gif","name": "Sub-task","subtask": true},"customfield_10071": null}}]}`)
+
+	// Mock for POST /rest/api/3/search/jql - handles multiple pages
+	testMux.HandleFunc("/rest/api/3/search/jql", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "POST")
+		testRequestURL(t, r, "/rest/api/3/search/jql")
+
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var payload map[string]interface{}
+		json.Unmarshal(bodyBytes, &payload)
+
+		jql := payload["jql"].(string)
+		maxResults := int(payload["maxResults"].(float64)) // JSON numbers are float64
+		token, hasToken := payload["nextPageToken"].(string)
+
+		if jql != "something" || maxResults != 2 {
+			t.Errorf("Unexpected JQL or MaxResults in request: %s", string(bodyBytes))
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 
-		t.Errorf("Unexpected URL: %v", r.URL)
+		w.WriteHeader(http.StatusOK)
+		if !hasToken { // First page
+			fmt.Fprint(w, `{"issues":[{"id":"10230","key":"BULK-62"},{"id":"10004","key":"BULK-47"}],"nextPageToken":"page2Token"}`)
+		} else if token == "page2Token" { // Second page
+			fmt.Fprint(w, `{"issues":[{"id":"10231","key":"BULK-63"},{"id":"10005","key":"BULK-48"}],"nextPageToken":"page3Token"}`)
+		} else if token == "page3Token" { // Third page (last)
+			fmt.Fprint(w, `{"issues":[{"id":"10232","key":"BULK-64"}],"nextPageToken":""}`) // No next token
+		} else {
+			t.Errorf("Unexpected nextPageToken received: %s", token)
+			w.WriteHeader(http.StatusBadRequest)
+		}
 	})
 
-	opt := &SearchOptions{StartAt: 1, MaxResults: 2, Expand: "foo", ValidateQuery: "warn"}
+	// Mock for POST /rest/api/3/issue/bulkfetch - handles multiple pages
+	testMux.HandleFunc("/rest/api/3/issue/bulkfetch", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "POST")
+		testRequestURL(t, r, "/rest/api/3/issue/bulkfetch")
+
+		var payload BulkFetchRequest
+		json.NewDecoder(r.Body).Decode(&payload)
+
+		// Check requested fields (assuming *navigable from old Expand=foo)
+		if diff := cmp.Diff([]string{"*navigable"}, payload.Fields); diff != "" {
+			t.Errorf("Bulk Fetch fields mismatch (-want +got):\n%s", diff)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		// Return different issues based on IDs requested
+		if cmp.Equal(payload.IssueIDsOrKeys, []string{"10230", "10004"}) { // Page 1 IDs
+			fmt.Fprint(w, `{"issues": [{"id": "10230","key": "BULK-62","fields": {"summary": "Issue 1"}},{"id": "10004","key": "BULK-47","fields": {"summary": "Issue 2"}}]}`)
+		} else if cmp.Equal(payload.IssueIDsOrKeys, []string{"10231", "10005"}) { // Page 2 IDs
+			fmt.Fprint(w, `{"issues": [{"id": "10231","key": "BULK-63","fields": {"summary": "Issue 3"}},{"id": "10005","key": "BULK-48","fields": {"summary": "Issue 4"}}]}`)
+		} else if cmp.Equal(payload.IssueIDsOrKeys, []string{"10232"}) { // Page 3 IDs
+			fmt.Fprint(w, `{"issues": [{"id": "10232","key": "BULK-64","fields": {"summary": "Issue 5"}}]}`)
+		} else {
+			t.Errorf("Unexpected Issue IDs in bulk fetch request: %v", payload.IssueIDsOrKeys)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+
+	// Use new SearchOptions, remove invalid fields (StartAt, Expand, ValidateQuery)
+	opt := &SearchOptions{MaxResults: 2, Fields: []string{"*navigable"}} // Assuming *navigable from old Expand=foo
 	issues := make([]Issue, 0)
 	err := testClient.Issue.SearchPages("something", opt, func(issue Issue) error {
 		issues = append(issues, issue)
@@ -740,29 +898,54 @@ func TestIssueService_SearchPages(t *testing.T) {
 		t.Errorf("Error given: %s", err)
 	}
 
+	// Check total number of issues collected across pages
 	if len(issues) != 5 {
 		t.Errorf("Expected 5 issues, %v given", len(issues))
+	}
+
+	// Optional: Add more specific checks for the content of the collected issues
+	expectedSummaries := []string{"Issue 1", "Issue 2", "Issue 3", "Issue 4", "Issue 5"}
+	if len(issues) == 5 {
+		for i, issue := range issues {
+			if issue.Fields == nil || issue.Fields.Summary != expectedSummaries[i] {
+				t.Errorf("Issue %d content mismatch. Expected summary '%s', got: %+v", i, expectedSummaries[i], issue.Fields)
+			}
+		}
 	}
 }
 
 func TestIssueService_SearchPages_EmptyResult(t *testing.T) {
 	setup()
 	defer teardown()
-	testMux.HandleFunc("/rest/api/2/search", func(w http.ResponseWriter, r *http.Request) {
-		testMethod(t, r, "GET")
-		if r.URL.String() == "/rest/api/2/search?expand=foo&jql=something&maxResults=50&startAt=1&validateQuery=warn" {
-			w.WriteHeader(http.StatusOK)
-			// This is what Jira outputs when the &maxResult= issue occurs. It used to cause SearchPages to go into an endless loop.
-			fmt.Fprint(w, `{"expand": "schema,names","startAt": 0,"maxResults": 0,"total": 6,"issues": []}`)
-			return
+
+	// Mock for POST /rest/api/3/search/jql returning empty results
+	testMux.HandleFunc("/rest/api/3/search/jql", func(w http.ResponseWriter, r *http.Request) {
+		testMethod(t, r, "POST")
+		testRequestURL(t, r, "/rest/api/3/search/jql")
+
+		// Check request body
+		expectedBody := `{"fields":["*navigable"],"jql":"something","maxResults":50}` // Assuming fields from old Expand
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var expectedMap, actualMap map[string]interface{}
+		json.Unmarshal([]byte(expectedBody), &expectedMap)
+		json.Unmarshal(bodyBytes, &actualMap)
+		if diff := cmp.Diff(expectedMap, actualMap); diff != "" {
+			t.Errorf("Request body mismatch (-want +got):\n%s", diff)
 		}
 
-		t.Errorf("Unexpected URL: %v", r.URL)
+		// Send empty response with no next token
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"issues":[],"nextPageToken":""}`)
 	})
 
-	opt := &SearchOptions{StartAt: 1, MaxResults: 50, Expand: "foo", ValidateQuery: "warn"}
+	// No bulk fetch mock needed
+
+	// Use new SearchOptions, remove invalid fields (StartAt, Expand, ValidateQuery)
+	opt := &SearchOptions{MaxResults: 50, Fields: []string{"*navigable"}} // Assuming *navigable from old Expand=foo
 	issues := make([]Issue, 0)
 	err := testClient.Issue.SearchPages("something", opt, func(issue Issue) error {
+		// This function should not be called if issues are empty
+		t.Errorf("Callback function called unexpectedly for empty result set")
 		issues = append(issues, issue)
 		return nil
 	})
@@ -771,6 +954,9 @@ func TestIssueService_SearchPages_EmptyResult(t *testing.T) {
 		t.Errorf("Error given: %s", err)
 	}
 
+	if len(issues) != 0 {
+		t.Errorf("Expected 0 issues, %v given", len(issues))
+	}
 }
 
 func TestIssueService_GetCustomFields(t *testing.T) {
@@ -823,7 +1009,7 @@ func TestIssueService_GetTransitions(t *testing.T) {
 
 	testAPIEndpoint := "/rest/api/2/issue/123/transitions"
 
-	raw, err := ioutil.ReadFile("./mocks/transitions.json")
+	raw, err := os.ReadFile("./mocks/transitions.json")
 	if err != nil {
 		t.Error(err.Error())
 	}
@@ -1787,7 +1973,7 @@ func TestIssueService_GetRemoteLinks(t *testing.T) {
 
 	testAPIEndpoint := "/rest/api/2/issue/123/remotelink"
 
-	raw, err := ioutil.ReadFile("./mocks/remote_links.json")
+	raw, err := os.ReadFile("./mocks/remote_links.json")
 	if err != nil {
 		t.Error(err.Error())
 	}

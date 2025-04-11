@@ -9,9 +9,7 @@ import (
 	"io/ioutil"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"reflect"
-	"strconv"
 	"strings"
 	"time"
 
@@ -509,31 +507,45 @@ type CommentVisibility struct {
 	Value string `json:"value,omitempty" structs:"value,omitempty"`
 }
 
-// SearchOptions specifies the optional parameters to various List methods that
-// support pagination.
-// Pagination is used for the Jira REST APIs to conserve server resources and limit
-// response size for resources that return potentially large collection of items.
-// A request to a pages API will result in a values array wrapped in a JSON object with some paging metadata
-// Default Pagination options
+// SearchOptions specifies the optional parameters for searching issues using JQL.
+// Pagination is handled using nextPageToken.
 type SearchOptions struct {
-	// StartAt: The starting index of the returned projects. Base index: 0.
-	StartAt int `url:"startAt,omitempty"`
-	// MaxResults: The maximum number of projects to return per page. Default: 50.
-	MaxResults int `url:"maxResults,omitempty"`
-	// Expand: Expand specific sections in the returned issues
-	Expand string `url:"expand,omitempty"`
-	Fields []string
-	// ValidateQuery: The validateQuery param offers control over whether to validate and how strictly to treat the validation. Default: strict.
-	ValidateQuery string `url:"validateQuery,omitempty"`
+	// MaxResults: The maximum number of issues to return per page. Default: 50.
+	MaxResults int `json:"maxResults,omitempty" url:"maxResults,omitempty"`
+	// Fields: The list of fields to return for each issue. By default, only ID and key are returned.
+	// Use "*all" to return all fields, "*navigable" to return navigable fields.
+	// See JIRA REST API documentation for more details.
+	Fields []string `json:"fields,omitempty" url:"fields,omitempty"`
+	// NextPageToken: Token for the next page of results. Use the value returned in the previous response.
+	NextPageToken string `json:"nextPageToken,omitempty" url:"nextPageToken,omitempty"`
 }
 
-// searchResult is only a small wrapper around the Search (with JQL) method
-// to be able to parse the results
-type searchResult struct {
-	Issues     []Issue `json:"issues" structs:"issues"`
-	StartAt    int     `json:"startAt" structs:"startAt"`
-	MaxResults int     `json:"maxResults" structs:"maxResults"`
-	Total      int     `json:"total" structs:"total"`
+// jqlSearchResult represents the response from the POST /search/jql endpoint.
+type jqlSearchResult struct {
+	Issues        []IssueRef `json:"issues" structs:"issues"`
+	NextPageToken string     `json:"nextPageToken,omitempty" structs:"nextPageToken,omitempty"`
+	// Note: Total, StartAt, MaxResults are not returned by this endpoint.
+}
+
+// IssueRef represents a basic reference to an issue, typically returned by /search/jql.
+type IssueRef struct {
+	Expand string `json:"expand,omitempty" structs:"expand,omitempty"`
+	ID     string `json:"id,omitempty" structs:"id,omitempty"`
+	Self   string `json:"self,omitempty" structs:"self,omitempty"`
+	Key    string `json:"key,omitempty" structs:"key,omitempty"`
+}
+
+// BulkFetchRequest represents the request body for the POST /issue/bulkfetch endpoint.
+type BulkFetchRequest struct {
+	IssueIDsOrKeys []string `json:"issueIdsOrKeys"`
+	Fields         []string `json:"fields,omitempty"`
+	// Expand could potentially be added here if supported by bulkfetch
+}
+
+// BulkFetchResponse represents the response from the POST /issue/bulkfetch endpoint.
+type BulkFetchResponse struct {
+	Issues []Issue `json:"issues"`
+	// Errors potentially? Check API docs.
 }
 
 // GetQueryOptions specifies the optional parameters for the Get Issue methods
@@ -613,7 +625,7 @@ type RemoteLinkStatus struct {
 // This can be an issue id, or an issue key.
 // If the issue cannot be found via an exact match, Jira will also look for the issue in a case-insensitive way, or by looking to see if the issue was moved.
 //
-// The given options will be appended to the query string
+// # The given options will be appended to the query string
 //
 // Jira API docs: https://docs.atlassian.com/jira/REST/latest/#api/2/issue-getIssue
 func (s *IssueService) GetWithContext(ctx context.Context, issueID string, options *GetQueryOptions) (*Issue, *Response, error) {
@@ -1084,101 +1096,174 @@ func (s *IssueService) AddLink(issueLink *IssueLink) (*Response, error) {
 	return s.AddLinkWithContext(context.Background(), issueLink)
 }
 
-// SearchWithContext will search for tickets according to the jql
+// bulkFetchIssuesWithContext fetches full issue details for a list of issue IDs or keys.
+// This is an internal helper function.
+func (s *IssueService) bulkFetchIssuesWithContext(ctx context.Context, issueIDsOrKeys []string, fields []string) ([]Issue, *Response, error) {
+	if len(issueIDsOrKeys) == 0 {
+		return []Issue{}, nil, nil // Nothing to fetch
+	}
+
+	apiEndpoint := "rest/api/3/issue/bulkfetch"
+	payload := BulkFetchRequest{
+		IssueIDsOrKeys: issueIDsOrKeys,
+		Fields:         fields,
+	}
+
+	req, err := s.client.NewRequestWithContext(ctx, "POST", apiEndpoint, payload)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	bulkResult := new(BulkFetchResponse)
+	resp, err := s.client.Do(req, bulkResult)
+	if err != nil {
+		return nil, resp, NewJiraError(resp, err)
+	}
+
+	return bulkResult.Issues, resp, nil
+}
+
+// SearchWithContext searches for issues using JQL via the POST /search/jql endpoint.
+// It returns the list of issues matching the JQL query, the response object, the next page token, and an error.
+// Note: This function now makes two API calls if fields are requested:
+// 1. POST /search/jql to get issue IDs/keys.
+// 2. POST /issue/bulkfetch to get the specified fields for those issues.
 //
-// Jira API docs: https://developer.atlassian.com/jiradev/jira-apis/jira-rest-apis/jira-rest-api-tutorials/jira-rest-api-example-query-issues
-func (s *IssueService) SearchWithContext(ctx context.Context, jql string, options *SearchOptions) ([]Issue, *Response, error) {
-	u := url.URL{
-		Path: "rest/api/2/search",
-	}
-	uv := url.Values{}
-	if jql != "" {
-		uv.Add("jql", jql)
-	}
+// WARNING: Breaking Changes from previous versions:
+// - SearchOptions struct has changed (StartAt, ValidateQuery, Expand removed; NextPageToken added).
+// - Function signature changed: returns nextPageToken as the third value.
+// - The returned Response object's pagination fields (StartAt, MaxResults, Total) are no longer populated from the search results.
+// - Search results are eventually consistent as per Jira Cloud API changes.
+// - Expand parameter is no longer supported in search.
+// - ValidateQuery parameter is no longer supported.
+//
+// Jira API docs:
+// - https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/#api-rest-api-3-search-jql-post
+// - https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/#api-rest-api-3-issue-bulkfetch-post
+func (s *IssueService) SearchWithContext(ctx context.Context, jql string, options *SearchOptions) ([]Issue, *Response, string, error) {
+	apiEndpoint := "rest/api/3/search/jql"
 
+	// Prepare request body for /search/jql
+	searchPayload := map[string]interface{}{
+		"jql": jql,
+	}
+	var fieldsToFetch []string
 	if options != nil {
-		if options.StartAt != 0 {
-			uv.Add("startAt", strconv.Itoa(options.StartAt))
+		if options.MaxResults > 0 {
+			searchPayload["maxResults"] = options.MaxResults
 		}
-		if options.MaxResults != 0 {
-			uv.Add("maxResults", strconv.Itoa(options.MaxResults))
+		if options.NextPageToken != "" {
+			searchPayload["nextPageToken"] = options.NextPageToken
 		}
-		if options.Expand != "" {
-			uv.Add("expand", options.Expand)
-		}
-		if strings.Join(options.Fields, ",") != "" {
-			uv.Add("fields", strings.Join(options.Fields, ","))
-		}
-		if options.ValidateQuery != "" {
-			uv.Add("validateQuery", options.ValidateQuery)
+		// Include fields in the search request for test compatibility
+		if len(options.Fields) > 0 {
+			searchPayload["fields"] = options.Fields
+			fieldsToFetch = options.Fields
 		}
 	}
 
-	u.RawQuery = uv.Encode()
-
-	req, err := s.client.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	req, err := s.client.NewRequestWithContext(ctx, "POST", apiEndpoint, searchPayload)
 	if err != nil {
-		return []Issue{}, nil, err
+		return nil, nil, "", err
 	}
 
-	v := new(searchResult)
-	resp, err := s.client.Do(req, v)
+	// Execute /search/jql request
+	jqlRes := new(jqlSearchResult)
+	resp, err := s.client.Do(req, jqlRes)
 	if err != nil {
-		err = NewJiraError(resp, err)
+		return nil, resp, "", NewJiraError(resp, err)
 	}
-	return v.Issues, resp, err
+
+	nextPageToken := jqlRes.NextPageToken
+
+	// If no issues found or no fields requested, return basic refs (or empty list)
+	if len(jqlRes.Issues) == 0 {
+		return []Issue{}, resp, nextPageToken, nil
+	}
+
+	// Extract IDs/Keys for bulk fetch
+	issueIDsOrKeys := make([]string, len(jqlRes.Issues))
+	for i, issueRef := range jqlRes.Issues {
+		issueIDsOrKeys[i] = issueRef.ID // Prefer ID for bulk fetch
+	}
+
+	// If fields were requested, perform bulk fetch
+	if len(fieldsToFetch) > 0 {
+		issues, bulkResp, bulkErr := s.bulkFetchIssuesWithContext(ctx, issueIDsOrKeys, fieldsToFetch)
+		if bulkErr != nil {
+			// Return the error from bulk fetch, but provide the token from the first call
+			return nil, bulkResp, nextPageToken, bulkErr
+		}
+		// Return the full issues and the response from the bulk fetch call
+		return issues, bulkResp, nextPageToken, nil
+	}
+
+	// If no fields requested, convert IssueRef to Issue (with limited data)
+	// This maintains the return type []Issue but with potentially sparse data.
+	// Alternatively, could change the return type to []IssueRef, but that's a bigger break.
+	issues := make([]Issue, len(jqlRes.Issues))
+	for i, ref := range jqlRes.Issues {
+		issues[i] = Issue{
+			Expand: ref.Expand,
+			ID:     ref.ID,
+			Self:   ref.Self,
+			Key:    ref.Key,
+			// Fields will be nil
+		}
+	}
+	// Return the limited issue data and the response from the initial /search/jql call
+	return issues, resp, nextPageToken, nil
+
 }
 
 // Search wraps SearchWithContext using the background context.
-func (s *IssueService) Search(jql string, options *SearchOptions) ([]Issue, *Response, error) {
+// See SearchWithContext for documentation on behavior and breaking changes.
+func (s *IssueService) Search(jql string, options *SearchOptions) ([]Issue, *Response, string, error) {
 	return s.SearchWithContext(context.Background(), jql, options)
 }
 
-// SearchPagesWithContext will get issues from all pages in a search
+// SearchPagesWithContext iterates through all pages of search results from SearchWithContext
+// and calls the provided function `f` for each issue.
+// It handles pagination automatically using the nextPageToken.
 //
-// Jira API docs: https://developer.atlassian.com/jiradev/jira-apis/jira-rest-apis/jira-rest-api-tutorials/jira-rest-api-example-query-issues
+// See SearchWithContext for documentation on behavior and breaking changes.
 func (s *IssueService) SearchPagesWithContext(ctx context.Context, jql string, options *SearchOptions, f func(Issue) error) error {
 	if options == nil {
-		options = &SearchOptions{
-			StartAt:    0,
-			MaxResults: 50,
-		}
+		options = &SearchOptions{}
 	}
-
-	if options.MaxResults == 0 {
+	// Ensure MaxResults is set for pagination, default to 50 if not provided or zero.
+	// Note: Jira's default might differ, but 50 is common. Check API docs for current default.
+	if options.MaxResults <= 0 {
 		options.MaxResults = 50
 	}
-
-	issues, resp, err := s.SearchWithContext(ctx, jql, options)
-	if err != nil {
-		return err
-	}
-
-	if len(issues) == 0 {
-		return nil
-	}
+	// Clear any initial token, start from the beginning
+	options.NextPageToken = ""
 
 	for {
+		issues, _, nextPageToken, err := s.SearchWithContext(ctx, jql, options)
+		if err != nil {
+			return err // Error during search
+		}
+
+		// Process the issues found on the current page
 		for _, issue := range issues {
-			err = f(issue)
-			if err != nil {
-				return err
+			if err := f(issue); err != nil {
+				return err // Error during processing by the callback function
 			}
 		}
 
-		if resp.StartAt+resp.MaxResults >= resp.Total {
+		// If there's no next page token, we're done
+		if nextPageToken == "" {
 			return nil
 		}
 
-		options.StartAt += resp.MaxResults
-		issues, resp, err = s.SearchWithContext(ctx, jql, options)
-		if err != nil {
-			return err
-		}
+		// Set the token for the next request
+		options.NextPageToken = nextPageToken
 	}
 }
 
 // SearchPages wraps SearchPagesWithContext using the background context.
+// See SearchWithContext for documentation on behavior and breaking changes.
 func (s *IssueService) SearchPages(jql string, options *SearchOptions, f func(Issue) error) error {
 	return s.SearchPagesWithContext(context.Background(), jql, options, f)
 }
@@ -1295,15 +1380,17 @@ func (s *IssueService) DoTransitionWithPayload(ticketID, payload interface{}) (*
 }
 
 // InitIssueWithMetaAndFields returns Issue with with values from fieldsConfig properly set.
-//  * metaProject should contain metaInformation about the project where the issue should be created.
-//  * metaIssuetype is the MetaInformation about the Issuetype that needs to be created.
-//  * fieldsConfig is a key->value pair where key represents the name of the field as seen in the UI
-//		And value is the string value for that particular key.
+//   - metaProject should contain metaInformation about the project where the issue should be created.
+//   - metaIssuetype is the MetaInformation about the Issuetype that needs to be created.
+//   - fieldsConfig is a key->value pair where key represents the name of the field as seen in the UI
+//     And value is the string value for that particular key.
+//
 // Note: This method doesn't verify that the fieldsConfig is complete with mandatory fields. The fieldsConfig is
-//		 supposed to be already verified with MetaIssueType.CheckCompleteAndAvailable. It will however return
-//		 error if the key is not found.
-//		 All values will be packed into Unknowns. This is much convenient. If the struct fields needs to be
-//		 configured as well, marshalling and unmarshalling will set the proper fields.
+//
+//	supposed to be already verified with MetaIssueType.CheckCompleteAndAvailable. It will however return
+//	error if the key is not found.
+//	All values will be packed into Unknowns. This is much convenient. If the struct fields needs to be
+//	configured as well, marshalling and unmarshalling will set the proper fields.
 func InitIssueWithMetaAndFields(metaProject *MetaProject, metaIssuetype *MetaIssueType, fieldsConfig map[string]string) (*Issue, error) {
 	issue := new(Issue)
 	issueFields := new(IssueFields)
